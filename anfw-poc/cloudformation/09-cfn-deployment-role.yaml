@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  09 - Least-privilege CloudFormation service role for the Network Firewall stacks. Resource ARNs are scoped
+  to this account, region and project prefix where the service supports it. Treat as a starting point:
+  run a first deployment, then tighten using CloudTrail AccessDenied events.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: anfw
+    Description: Project prefix; the role may only manage resources named with it.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,14}$'
+  Environment:
+    Type: String
+    Default: poc
+    AllowedValues: [poc, dev, stg, prod]
+    Description: Deployment environment.
+  Owner:
+    Type: String
+    Default: platform-team
+    Description: Owner tag value.
+    AllowedPattern: '^[A-Za-z0-9 ._@:/=+-]{1,128}$'
+
+Resources:
+  CfnDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-cfn-nfw-deploy"
+      Description: Assumed by CloudFormation to deploy the Network Firewall POC stacks.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-*/*"
+      Policies:
+        - PolicyName: network-firewall-and-networking
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: NetworkFirewallManageProjectResources
+                Effect: Allow
+                Action:
+                  - network-firewall:CreateFirewall
+                  - network-firewall:CreateFirewallPolicy
+                  - network-firewall:CreateRuleGroup
+                  - network-firewall:DeleteFirewall
+                  - network-firewall:DeleteFirewallPolicy
+                  - network-firewall:DeleteRuleGroup
+                  - network-firewall:UpdateFirewallDescription
+                  - network-firewall:UpdateFirewallPolicy
+                  - network-firewall:UpdateRuleGroup
+                  - network-firewall:AssociateFirewallPolicy
+                  - network-firewall:AssociateSubnets
+                  - network-firewall:DisassociateSubnets
+                  - network-firewall:UpdateFirewallDeleteProtection
+                  - network-firewall:UpdateFirewallPolicyChangeProtection
+                  - network-firewall:UpdateSubnetChangeProtection
+                  - network-firewall:UpdateLoggingConfiguration
+                  - network-firewall:TagResource
+                  - network-firewall:UntagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:network-firewall:${AWS::Region}:${AWS::AccountId}:firewall/${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:network-firewall:${AWS::Region}:${AWS::AccountId}:firewall-policy/${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:network-firewall:${AWS::Region}:${AWS::AccountId}:stateful-rulegroup/${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:network-firewall:${AWS::Region}:${AWS::AccountId}:stateless-rulegroup/${ProjectName}-*"
+              - Sid: NetworkFirewallReadAndManagedGroups
+                Effect: Allow
+                Action:
+                  - network-firewall:Describe*
+                  - network-firewall:List*
+                Resource: "*"
+              - Sid: Ec2ForFirewallEndpoints
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:CreateVpcEndpoint
+                  - ec2:DeleteVpcEndpoints
+                  - ec2:CreateTags
+                Resource: "*"
+              - Sid: NetworkFirewallServiceLinkedRole
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/network-firewall.amazonaws.com/AWSServiceRoleForNetworkFirewall"
+                Condition:
+                  StringEquals:
+                    "iam:AWSServiceName": network-firewall.amazonaws.com
+        - PolicyName: logging-encryption-monitoring
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LogGroupsAndFilters
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:AssociateKmsKey
+                  - logs:TagResource
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/network-firewall/${ProjectName}-*"
+              - Sid: LogDeliveryForFirewallLogging
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeMetricFilters
+                  - logs:DescribeResourcePolicies
+                  - logs:PutResourcePolicy
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                Resource: "*"
+              - Sid: ArchiveBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:ListBucket
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketVersioning
+                  - s3:PutBucketVersioning
+                  - s3:GetLifecycleConfiguration
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetBucketOwnershipControls
+                  - s3:PutBucketOwnershipControls
+                  - s3:GetBucketTagging
+                  - s3:PutBucketTagging
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ProjectName}-*-nfw-logs-${AWS::AccountId}-${AWS::Region}"
+              - Sid: KmsKeyLifecycle
+                Effect: Allow
+                Action:
+                  - kms:CreateKey
+                  - kms:CreateAlias
+                  - kms:DeleteAlias
+                  - kms:DescribeKey
+                  - kms:GetKeyPolicy
+                  - kms:PutKeyPolicy
+                  - kms:EnableKeyRotation
+                  - kms:GetKeyRotationStatus
+                  - kms:TagResource
+                  - kms:ListResourceTags
+                  - kms:CreateGrant
+                Resource: "*"
+              - Sid: AlarmTopic
+                Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:GetSubscriptionAttributes
+                  - sns:TagResource
+                Resource: !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-*"
+              - Sid: AlarmsAndDashboard
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:DeleteDashboards
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:TagResource
+                  - cloudwatch:ListTagsForResource
+                Resource: "*"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+Outputs:
+  CfnDeploymentRoleArn:
+    Description: Pass to --role-arn when deploying the firewall stacks.
+    Value: !GetAtt CfnDeploymentRole.Arn
