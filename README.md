@@ -1,147 +1,58 @@
-# kubelogin [![go](https://github.com/int128/kubelogin/actions/workflows/go.yaml/badge.svg)](https://github.com/int128/kubelogin/actions/workflows/go.yaml) [![Go Report Card](https://goreportcard.com/badge/github.com/int128/kubelogin)](https://goreportcard.com/report/github.com/int128/kubelogin)
+# AWS Network Firewall vs Sophos POC package
 
-This is a kubectl plugin for [Kubernetes OpenID Connect (OIDC) authentication](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#openid-connect-tokens), also known as `kubectl oidc-login`.
+| Document | What it is |
+|---|---|
+| [`cloudformation/`](cloudformation) | Production-oriented CloudFormation for AWS Network Firewall (parent + nested stacks) |
+| [`docs/customer-guide.md`](docs/customer-guide.md) | How customers manage ingress, egress, east-west and domain lists through parameters |
+| [`docs/sophos-setup.md`](docs/sophos-setup.md) | Sophos Firewall on AWS: options, licensing, setup, policy, HA, operations |
+| [`docs/comparison.md`](docs/comparison.md) | Feature comparison, cost model, results sheet, weighted decision matrix |
+| [`docs/pitch.md`](docs/pitch.md) | The case for AWS Network Firewall, including where Sophos is better |
+| [`scripts/deploy.sh`](scripts/deploy.sh) | Package, validate, change-set review, deploy |
 
-Here is an example of Kubernetes authentication with the Google Identity Platform:
+## What is in the CloudFormation
+| Template | Purpose |
+|---|---|
+| `firewall-master.yaml` | Parent stack with all customer-facing parameters |
+| `08-logging-monitoring.yaml` | KMS key, alert log group, S3 archive, SNS, alarms, dashboard (deployed first) |
+| `02-network-firewall-rule-groups.yaml` | Stateless baseline; IP/domain denylists; allowlist; **app presets (Google, YouTube, Facebook, Instagram, WhatsApp, X, LinkedIn, TikTok, Microsoft 365, Netflix)**; **traffic policy (ingress, east-west, egress ports/CIDRs, QUIC)**; SSH/RDP; DNS; IPS |
+| `03-network-firewall-policy.yaml` | Strict-order policy; `EnforcementMode` alert/drop; `EgressMode` allowlist/open |
+| `04-network-firewall-deployment.yaml` | Firewall (endpoint per AZ), protections, logging |
+| `09-cfn-deployment-role.yaml` | Least-privilege CloudFormation service role |
 
-<img alt="screencast" src="https://user-images.githubusercontent.com/321266/85427290-86e43700-b5b6-11ea-9e97-ffefd736c9b7.gif" width="572" height="391">
+Validated with `cfn-lint` 1.61.0 (only warnings: relative nested template paths, resolved by `aws cloudformation package`).
+**Not yet deployed to an AWS account.** Still to build: `01` VPC, `05` routing, `06`/`07` Transit Gateway and centralized inspection.
 
-Kubelogin is designed to run as a [client-go credential plugin](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#client-go-credential-plugins).
-When you run kubectl, kubelogin opens the browser and you can log in to the provider.
-Then kubelogin gets a token from the provider and kubectl access Kubernetes APIs with the token.
-Take a look at the diagram:
-
-![Diagram of the credential plugin](docs/credential-plugin-diagram.svg)
-
-## Getting Started
-
-### Setup
-
-Install the latest release from [Homebrew](https://brew.sh/), [Krew](https://github.com/kubernetes-sigs/krew), [Chocolatey](https://chocolatey.org/packages/kubelogin) or [GitHub Releases](https://github.com/int128/kubelogin/releases).
-
-```sh
-# Homebrew (macOS and Linux)
-brew install kubelogin
-
-# Krew (macOS, Linux, Windows and ARM)
-kubectl krew install oidc-login
-
-# Chocolatey (Windows)
-choco install kubelogin
+## Quick start
+```bash
+# 1. edit cloudformation/params/poc-existing-vpc.json (VPC, firewall subnets, AZs)
+# 2. deploy (reviews a change set before executing)
+./scripts/deploy.sh anfw-poc-firewall <artifact-bucket> cloudformation/params/poc-existing-vpc.json
+# 3. watch the CloudWatch dashboard "<project>-<env>-network-firewall"; switch EnforcementMode to drop when ready
 ```
 
-If you install via GitHub releases, save the binary as the name `kubectl-oidc_login` on your path.
-When you invoke `kubectl oidc-login`, kubectl finds it by the [naming convention of kubectl plugins](https://kubernetes.io/docs/tasks/extend-kubectl/kubectl-plugins/).
-The other install methods do this for you.
+## How the customer controls traffic (summary)
+- **Egress:** `EgressMode` (allowlist or open), app presets `Preset*` = none/allow/block, `DomainAllowlist`, `DomainDenylist`, `EgressAllowedTcpPorts`, `EgressAllowedUdpPorts`, `EgressAllowedDestinationCidrs`, `BlockQuic`.
+- **Ingress:** `IngressMode`, `IngressAllowedSourceCidrs`, `IngressAllowedTcpPorts`, `IngressAllowedUdpPorts`, `AdminAllowedCidrs`, `BlockedIpCidrs`.
+- **East-west:** `EastWestMode`, `EastWestAllowedTcpPorts`, `HomeNetCidrs`.
+- **Rollout:** `EnforcementMode`, `StreamExceptionPolicy`. Details and examples in `docs/customer-guide.md`.
 
-You need to set up the OIDC provider, cluster role binding, Kubernetes API server and kubeconfig.
-Your kubeconfig looks like this:
+## Order of work
+1. Deploy the firewall stack in alert mode (non-disruptive; changes no routes).
+2. Build and review routing (`05`), then route one subnet or AZ at a time.
+3. Run the test plan against AWS and Sophos, fill `docs/comparison.md` sections 4 and 5.
+4. Decide and switch to `drop`.
 
-```yaml
-users:
-  - name: oidc
-    user:
-      exec:
-        apiVersion: client.authentication.k8s.io/v1
-        command: kubectl
-        args:
-          - oidc-login
-          - get-token
-          - --oidc-issuer-url=ISSUER_URL
-          - --oidc-client-id=YOUR_CLIENT_ID
-```
+## Verify on first deployment
+1. Managed rule group names (`MalwareDomainsStrictOrder`, `BotNetCommandAndControlDomainsStrictOrder`, `ThreatSignaturesIOCStrictOrder`): `aws network-firewall list-rule-groups --scope MANAGED`, or disable the toggles.
+2. Metric `ReceivedPackets` with `Engine=Stateless` used by the path-health alarms.
+3. Rule groups defining variables that are only used when a feature is enabled (the traffic-policy group uses placeholder values for unused lists). If the service rejects a placeholder, set that list to a real value or tell me and I will restructure it.
+4. Number of stateful rule groups attached to the policy against your account quota (up to 13 are attached with all toggles on).
+5. Preset domain lists against real traffic; CDN domains change.
+6. Behaviour of non-allowlisted domains under the default action (test cases 3 and 4).
+7. Deployment role permissions; tighten using CloudTrail AccessDenied events.
+8. Current prices (Network Firewall, NAT, Transit Gateway) on the AWS pricing pages and Sophos prices from Marketplace and your partner.
 
-See the [setup guide](docs/setup.md) for more.
-
-### Run
-
-Run kubectl.
-
-```sh
-kubectl get pods
-```
-
-Kubectl executes kubelogin before calling the Kubernetes APIs.
-Kubelogin automatically opens the browser, and you can log in to the provider.
-
-After the authentication, kubelogin returns the credentials to kubectl.
-Kubectl then calls the Kubernetes APIs with the credentials.
-
-```console
-% kubectl get pods
-Open http://localhost:8000 for authentication
-NAME                          READY   STATUS    RESTARTS   AGE
-echoserver-86c78fdccd-nzmd5   1/1     Running   0          26d
-```
-
-Kubelogin stores the ID token and refresh token to the cache.
-If the ID token is valid, it just returns it.
-If the ID token has expired, it will refresh the token using the refresh token.
-If the refresh token has expired, it will perform re-authentication.
-
-## Troubleshooting
-
-### Token cache
-
-Kubelogin stores the token cache to the file system by default.
-For enhanced security, it is recommended to store it to the keyring.
-See the [token cache](docs/usage.md#token-cache) for details.
-
-You can log out by deleting the token cache.
-
-```console
-% kubectl oidc-login clean
-Deleted the token cache at /home/user/.kube/cache/oidc-login
-Deleted the token cache from the keyring
-```
-
-Kubelogin will ask you to log in via the browser again.
-If the browser has a cookie for the provider, you need to log out from the provider or clear the cookie.
-
-### ID token claims
-
-You can run `setup` command to dump the claims of an ID token from the provider.
-
-```console
-% kubectl oidc-login setup --oidc-issuer-url=ISSUER_URL --oidc-client-id=REDACTED
-...
-You got a token with the following claims:
-
-{
-  "sub": "********",
-  "iss": "https://accounts.google.com",
-  "aud": "********",
-  ...
-}
-```
-
-You can set `-v1` option to increase the log level.
-
-```yaml
-users:
-  - name: oidc
-    user:
-      exec:
-        apiVersion: client.authentication.k8s.io/v1
-        command: kubectl
-        args:
-          - oidc-login
-          - get-token
-          - -v1
-```
-
-You can run the [acceptance test](acceptance_test) to verify if kubelogin works with your provider.
-
-## Docs
-
-- [Setup guide](docs/setup.md)
-- [Usage and options](docs/usage.md)
-- [Standalone mode](docs/standalone-mode.md)
-- [System test](system_test)
-- [Acceptance_test for identity providers](acceptance_test)
-
-## Contributions
-
-This is an open source software licensed under Apache License 2.0.
-Feel free to open issues and pull requests for improving code and documents.
-# aws-network-firewall
+## Rollback
+- Rules: restore the previous parameter file or set `EnforcementMode=alert`, update the stack.
+- Traffic path: restore saved routes. The firewall may stay deployed but bypassed.
+- Removal: lift protections, remove routes, delete the stack. KMS key and S3 bucket are retained deliberately.

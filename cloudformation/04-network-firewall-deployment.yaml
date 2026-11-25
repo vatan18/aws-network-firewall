@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  04 - AWS Network Firewall deployment: firewall with one endpoint per supplied firewall subnet,
+  change protections and logging (ALERT to CloudWatch Logs, FLOW to S3). Does NOT change any route table;
+  routing is a separate, reviewed step (template 05).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Naming and tagging }
+        Parameters: [ProjectName, Environment, Owner, CostCenter]
+      - Label: { default: Placement }
+        Parameters: [VpcId, FirewallSubnetCount, FirewallSubnetIds, FirewallPolicyArn]
+      - Label: { default: Protection }
+        Parameters: [DeleteProtection, FirewallPolicyChangeProtection, SubnetChangeProtection]
+      - Label: { default: Logging }
+        Parameters: [EnableAlertLogs, EnableFlowLogs, AlertLogGroupName, ArchiveBucketName, FlowLogPrefix]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: anfw
+    Description: Short project prefix used in resource names.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,14}$'
+  Environment:
+    Type: String
+    Default: poc
+    AllowedValues: [poc, dev, stg, prod]
+    Description: Deployment environment.
+  Owner:
+    Type: String
+    Default: platform-team
+    Description: Owner tag value.
+    AllowedPattern: '^[A-Za-z0-9 ._@:/=+-]{1,128}$'
+  CostCenter:
+    Type: String
+    Default: infra-security
+    Description: CostCenter tag value.
+    AllowedPattern: '^[A-Za-z0-9 ._@:/=+-]{1,128}$'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that hosts the firewall endpoints (the workload VPC, or the inspection VPC for centralized designs).
+  FirewallSubnetCount:
+    Type: String
+    Default: "2"
+    AllowedValues: ["2", "3"]
+    Description: Number of firewall subnets supplied (one per AZ).
+  FirewallSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Dedicated firewall subnets, one per AZ (minimum /28), listed in the same AZ order as the alarms in template 08.
+  FirewallPolicyArn:
+    Type: String
+    Description: Firewall policy ARN from template 03.
+    AllowedPattern: '^arn:aws[a-z-]*:network-firewall:[a-z0-9-]+:[0-9]{12}:firewall-policy/.+$'
+  DeleteProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Prevent deletion of the firewall. Use true in production.
+  FirewallPolicyChangeProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Block changing the associated policy. Use true in production and lift it deliberately for changes.
+  SubnetChangeProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Block changing subnet associations. Use true in production.
+  EnableAlertLogs:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Send ALERT logs to CloudWatch Logs.
+  EnableFlowLogs:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Send FLOW logs to S3.
+  AlertLogGroupName:
+    Type: String
+    Description: CloudWatch Logs group from template 08.
+    AllowedPattern: '^[.\-_/#A-Za-z0-9]{1,512}$'
+  ArchiveBucketName:
+    Type: String
+    Description: S3 bucket from template 08.
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{2,62}$'
+  FlowLogPrefix:
+    Type: String
+    Default: network-firewall
+    Description: S3 prefix; must match the prefix permitted by the bucket policy in template 08.
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9/_-]{0,63}$'
+
+Conditions:
+  HasThirdSubnet: !Equals [!Ref FirewallSubnetCount, "3"]
+  LogAlerts: !Equals [!Ref EnableAlertLogs, "true"]
+  LogFlows: !Equals [!Ref EnableFlowLogs, "true"]
+  ConfigureLogging: !Or [!Condition LogAlerts, !Condition LogFlows]
+
+Resources:
+  Firewall:
+    Type: AWS::NetworkFirewall::Firewall
+    Properties:
+      FirewallName: !Sub "${ProjectName}-${Environment}-fw"
+      Description: !Sub "${ProjectName}-${Environment} AWS Network Firewall"
+      FirewallPolicyArn: !Ref FirewallPolicyArn
+      VpcId: !Ref VpcId
+      SubnetMappings:
+        - SubnetId: !Select [0, !Ref FirewallSubnetIds]
+        - SubnetId: !Select [1, !Ref FirewallSubnetIds]
+        - !If
+          - HasThirdSubnet
+          - SubnetId: !Select [2, !Ref FirewallSubnetIds]
+          - !Ref AWS::NoValue
+      DeleteProtection: !Ref DeleteProtection
+      FirewallPolicyChangeProtection: !Ref FirewallPolicyChangeProtection
+      SubnetChangeProtection: !Ref SubnetChangeProtection
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${Environment}-fw" }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+  FirewallLogging:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Condition: ConfigureLogging
+    Properties:
+      FirewallArn: !GetAtt Firewall.FirewallArn
+      FirewallName: !Sub "${ProjectName}-${Environment}-fw"
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - !If
+            - LogAlerts
+            - LogType: ALERT
+              LogDestinationType: CloudWatchLogs
+              LogDestination:
+                logGroup: !Ref AlertLogGroupName
+            - !Ref AWS::NoValue
+          - !If
+            - LogFlows
+            - LogType: FLOW
+              LogDestinationType: S3
+              LogDestination:
+                bucketName: !Ref ArchiveBucketName
+                prefix: !Ref FlowLogPrefix
+            - !Ref AWS::NoValue
+
+Outputs:
+  FirewallArn:
+    Description: Firewall ARN.
+    Value: !GetAtt Firewall.FirewallArn
+    Export: { Name: !Sub "${AWS::StackName}-FirewallArn" }
+  FirewallName:
+    Description: Firewall name (matches the FirewallName used for alarms in template 08).
+    Value: !Sub "${ProjectName}-${Environment}-fw"
+  FirewallId:
+    Description: Firewall ID.
+    Value: !GetAtt Firewall.FirewallId
+  EndpointIds:
+    Description: AZ-to-endpoint mapping (az:vpce-id). Template 05 consumes this to build per-AZ routes.
+    Value: !Join [",", !GetAtt Firewall.EndpointIds]
+    Export: { Name: !Sub "${AWS::StackName}-EndpointIds" }

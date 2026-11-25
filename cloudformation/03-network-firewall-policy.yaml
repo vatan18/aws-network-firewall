@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  03 - AWS Network Firewall policy (STRICT_ORDER). EnforcementMode=alert converts every stateful drop
+  into an alert (DROP_TO_ALERT) and withholds the stateless drop group, so the policy can be observed
+  before enforcement. Switch to drop to enforce.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Naming and tagging }
+        Parameters: [ProjectName, Environment, Owner, CostCenter]
+      - Label: { default: Behaviour }
+        Parameters: [EnforcementMode, EgressMode, StatefulDefaultDropAction, StreamExceptionPolicy, HomeNetCidrs, TlsInspectionConfigurationArn]
+      - Label: { default: Rule groups from template 02 }
+        Parameters: [StatelessBaselineRuleGroupArn, IpDenylistRuleGroupArn, DomainDenylistRuleGroupArn, DomainAllowlistRuleGroupArn, AdminAccessRuleGroupArn, DnsSecurityRuleGroupArn, IpsSignaturesRuleGroupArn, PresetAllowRuleGroupArn, PresetBlockRuleGroupArn, TrafficPolicyRuleGroupArn]
+      - Label: { default: AWS managed rule groups }
+        Parameters: [EnableManagedMalwareDomains, EnableManagedBotnetC2Domains, EnableManagedThreatSignaturesIoc]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: anfw
+    Description: Short project prefix used in resource names.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,14}$'
+  Environment:
+    Type: String
+    Default: poc
+    AllowedValues: [poc, dev, stg, prod]
+    Description: Deployment environment.
+  Owner:
+    Type: String
+    Default: platform-team
+    Description: Owner tag value.
+    AllowedPattern: '^[A-Za-z0-9 ._@:/=+-]{1,128}$'
+  CostCenter:
+    Type: String
+    Default: infra-security
+    Description: CostCenter tag value.
+    AllowedPattern: '^[A-Za-z0-9 ._@:/=+-]{1,128}$'
+  EnforcementMode:
+    Type: String
+    Default: alert
+    AllowedValues: [alert, drop]
+    Description: alert = observe only (safe first rollout). drop = enforce.
+  StatefulDefaultDropAction:
+    Type: String
+    Default: aws:drop_established_strict
+    AllowedValues: [aws:drop_established_strict, aws:drop_strict]
+    Description: >-
+      Default action in drop mode. drop_established_strict lets the TCP/TLS handshake complete so domain
+      rules can read SNI/Host; it does not drop unmatched UDP/ICMP first packets. drop_strict drops all unmatched traffic.
+  StreamExceptionPolicy:
+    Type: String
+    Default: DROP
+    AllowedValues: [DROP, REJECT, CONTINUE]
+    Description: Behaviour when the stateful engine cannot track a flow (for example asymmetric routing). Use CONTINUE during an alert-only rollout.
+  HomeNetCidrs:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      Optional HOME_NET override. Empty uses the firewall VPC CIDR. Required for centralized inspection
+      so spoke VPC CIDRs count as internal.
+    AllowedPattern: '^$|^([0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2})(,[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2})*$'
+  TlsInspectionConfigurationArn:
+    Type: String
+    Default: ""
+    Description: Optional TLS inspection configuration ARN. Leave empty; enable only after certificate, scope and cost review.
+    AllowedPattern: '^$|^arn:aws[a-z-]*:network-firewall:[a-z0-9-]+:[0-9]{12}:tls-configuration/.+$'
+  StatelessBaselineRuleGroupArn:
+    Type: String
+    Default: ""
+    Description: Stateless baseline ARN from template 02 (empty if disabled).
+  IpDenylistRuleGroupArn:
+    Type: String
+    Description: IP denylist rule group ARN from template 02.
+  DomainDenylistRuleGroupArn:
+    Type: String
+    Description: Domain denylist rule group ARN from template 02.
+  DomainAllowlistRuleGroupArn:
+    Type: String
+    Description: Domain allowlist rule group ARN from template 02.
+  AdminAccessRuleGroupArn:
+    Type: String
+    Description: SSH/RDP rule group ARN from template 02.
+  DnsSecurityRuleGroupArn:
+    Type: String
+    Description: DNS security rule group ARN from template 02.
+  IpsSignaturesRuleGroupArn:
+    Type: String
+    Description: Custom IPS rule group ARN from template 02.
+  EgressMode:
+    Type: String
+    Default: allowlist
+    AllowedValues: [allowlist, open]
+    Description: allowlist = default-deny outbound. open = default-allow outbound except blocked items. Must match template 02.
+  PresetAllowRuleGroupArn:
+    Type: String
+    Description: Preset allow rule group ARN from template 02.
+  PresetBlockRuleGroupArn:
+    Type: String
+    Description: Preset block rule group ARN from template 02.
+  TrafficPolicyRuleGroupArn:
+    Type: String
+    Description: Traffic policy (ingress, east-west, egress ports) rule group ARN from template 02.
+  EnableManagedMalwareDomains:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Attach AWS managed MalwareDomainsStrictOrder. Confirm availability with aws network-firewall list-rule-groups --scope MANAGED.
+  EnableManagedBotnetC2Domains:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Attach AWS managed BotNetCommandAndControlDomainsStrictOrder.
+  EnableManagedThreatSignaturesIoc:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Attach AWS managed ThreatSignaturesIOCStrictOrder.
+
+Conditions:
+  IsEnforcing: !Equals [!Ref EnforcementMode, drop]
+  EgressAllowlist: !Equals [!Ref EgressMode, allowlist]
+  UseEstablishedDrop: !Equals [!Ref StatefulDefaultDropAction, "aws:drop_established_strict"]
+  HasStatelessBaseline: !Not [!Equals [!Ref StatelessBaselineRuleGroupArn, ""]]
+  AttachStateless: !And [!Condition IsEnforcing, !Condition HasStatelessBaseline]
+  HasHomeNet: !Not [!Equals [!Join ["", !Ref HomeNetCidrs], ""]]
+  HasTlsConfig: !Not [!Equals [!Ref TlsInspectionConfigurationArn, ""]]
+  AttachManagedMalware: !Equals [!Ref EnableManagedMalwareDomains, "true"]
+  AttachManagedBotnet: !Equals [!Ref EnableManagedBotnetC2Domains, "true"]
+  AttachManagedIoc: !Equals [!Ref EnableManagedThreatSignaturesIoc, "true"]
+
+Resources:
+  FirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      FirewallPolicyName: !Sub "${ProjectName}-${Environment}-policy"
+      Description: !Sub "${ProjectName}-${Environment} strict-order policy (mode ${EnforcementMode})"
+      FirewallPolicy:
+        StatelessDefaultActions: ["aws:forward_to_sfe"]
+        StatelessFragmentDefaultActions: ["aws:forward_to_sfe"]
+        StatelessRuleGroupReferences: !If
+          - AttachStateless
+          - - Priority: 10
+              ResourceArn: !Ref StatelessBaselineRuleGroupArn
+          - !Ref AWS::NoValue
+        StatefulEngineOptions:
+          RuleOrder: STRICT_ORDER
+          StreamExceptionPolicy: !Ref StreamExceptionPolicy
+        StatefulDefaultActions: !If
+          - EgressAllowlist
+          - !If
+            - IsEnforcing
+            - !If
+              - UseEstablishedDrop
+              - ["aws:drop_established_strict", "aws:alert_established_strict"]
+              - ["aws:drop_strict", "aws:alert_strict"]
+            - ["aws:alert_established_strict"]
+          - !Ref AWS::NoValue
+        StatefulRuleGroupReferences:
+          - Priority: 100
+            ResourceArn: !Ref IpDenylistRuleGroupArn
+            Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+          - !If
+            - AttachManagedMalware
+            - Priority: 110
+              ResourceArn: !Sub "arn:${AWS::Partition}:network-firewall:${AWS::Region}:aws-managed:stateful-rulegroup/MalwareDomainsStrictOrder"
+              Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+            - !Ref "AWS::NoValue"
+          - !If
+            - AttachManagedBotnet
+            - Priority: 120
+              ResourceArn: !Sub "arn:${AWS::Partition}:network-firewall:${AWS::Region}:aws-managed:stateful-rulegroup/BotNetCommandAndControlDomainsStrictOrder"
+              Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+            - !Ref "AWS::NoValue"
+          - Priority: 130
+            ResourceArn: !Ref DomainDenylistRuleGroupArn
+            Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+          - !If
+            - AttachManagedIoc
+            - Priority: 140
+              ResourceArn: !Sub "arn:${AWS::Partition}:network-firewall:${AWS::Region}:aws-managed:stateful-rulegroup/ThreatSignaturesIOCStrictOrder"
+              Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+            - !Ref "AWS::NoValue"
+          - Priority: 135
+            ResourceArn: !Ref PresetBlockRuleGroupArn
+            Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+          - Priority: 200
+            ResourceArn: !Ref AdminAccessRuleGroupArn
+            Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+          - Priority: 210
+            ResourceArn: !Ref DnsSecurityRuleGroupArn
+            Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+          - Priority: 300
+            ResourceArn: !Ref IpsSignaturesRuleGroupArn
+            Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+          - Priority: 800
+            ResourceArn: !Ref TrafficPolicyRuleGroupArn
+            Override: !If [IsEnforcing, !Ref "AWS::NoValue", { Action: DROP_TO_ALERT }]
+          - Priority: 900
+            ResourceArn: !Ref DomainAllowlistRuleGroupArn
+          - Priority: 910
+            ResourceArn: !Ref PresetAllowRuleGroupArn
+        PolicyVariables: !If
+          - HasHomeNet
+          - RuleVariables:
+              HOME_NET:
+                Definition: !Ref HomeNetCidrs
+          - !Ref AWS::NoValue
+        TLSInspectionConfigurationArn: !If [HasTlsConfig, !Ref TlsInspectionConfigurationArn, !Ref "AWS::NoValue"]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: Owner, Value: !Ref Owner }
+        - { Key: CostCenter, Value: !Ref CostCenter }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+Outputs:
+  FirewallPolicyArn:
+    Description: Firewall policy ARN.
+    Value: !GetAtt FirewallPolicy.FirewallPolicyArn
+    Export: { Name: !Sub "${AWS::StackName}-FirewallPolicyArn" }
+  EnforcementMode:
+    Description: Mode this policy was deployed in.
+    Value: !Ref EnforcementMode
